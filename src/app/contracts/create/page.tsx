@@ -1,0 +1,1011 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import { supabase } from '@/lib/supabaseClient';
+import { Room } from '@/types/database';
+import { useRouter } from 'next/navigation';
+import { Eye, EyeOff, ArrowLeft } from 'lucide-react';
+
+export default function CreateContractPage() {
+    const router = useRouter();
+    // State for Branch/Building Selection
+    const [branches, setBranches] = useState<{ id: number; branches_name: string; city: string }[]>([]);
+    const [buildings, setBuildings] = useState<{ id: number; name_building: string; elec_meter: number; water_meter: number }[]>([]);
+
+    // Selected IDs
+    const [selectedBranchId, setSelectedBranchId] = useState<string>('');
+    const [selectedBuildingId, setSelectedBuildingId] = useState<string>('');
+
+    // General UI States
+    const [loading, setLoading] = useState(true);
+    const [submitting, setSubmitting] = useState(false);
+    const [contractNumberDisplay, setContractNumberDisplay] = useState('Select Branch...');
+
+    // Room Data State
+    const [rooms, setRooms] = useState<(Room & { residentCount: number; hasPrimaryTenant: boolean })[]>([]);
+    const [roomType, setRoomType] = useState<'vacant' | 'occupied'>('vacant');
+    const [branchContractCount, setBranchContractCount] = useState<number>(0);
+
+    // Form Data State
+    const [formData, setFormData] = useState({
+        full_name: '',
+        gender: 'male',
+        phone: '',
+        email: '',
+        pet: 'none',
+        residents: '1',
+        identification_number: '',
+        identification_type: 'THAI_ID' as 'THAI_ID' | 'PASSPORT',
+        nation: 'Thai',
+        room_id: '',
+        move_in: '',
+        durations: '12',
+        move_out: '',
+        username: '',
+        password: '',
+        is_primary_tenant: 'TRUE',
+        water_config_type: 'unit' as 'unit' | 'fixed',
+        water_fixed_price: '',
+    });
+
+
+    // Form Aux States
+    const [petOption, setPetOption] = useState<'none' | 'dog' | 'cat' | 'other'>('none');
+    const [petOtherText, setPetOtherText] = useState('');
+    const [countryCode, setCountryCode] = useState('+66');
+    const [moveOutRange, setMoveOutRange] = useState({ min: '', max: '' });
+    const [showPassword, setShowPassword] = useState(false);
+
+    useEffect(() => {
+        async function fetchInitialData() {
+            try {
+                // 1. Fetch All Branches
+                const { data: branchData, error: branchError } = await supabase
+                    .from('branch')
+                    .select('id, city, branches_name')
+                    .order('id');
+
+                if (branchError) throw branchError;
+                setBranches(branchData || []);
+
+                // Check for logged-in Manager's branch
+                const storedRole = localStorage.getItem('user_role');
+                const storedBranchId = localStorage.getItem('user_branch_id');
+
+                if (storedRole && storedRole.toLowerCase() === 'manager' && storedBranchId) {
+                    setSelectedBranchId(storedBranchId);
+                }
+            } catch (error) {
+                console.error('Error fetching initial data:', error);
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        fetchInitialData();
+    }, []);
+
+    // Fetch Buildings when Branch Changes
+    useEffect(() => {
+        async function fetchBuildings() {
+            if (!selectedBranchId) {
+                setBuildings([]);
+                return;
+            }
+
+            const { data, error } = await supabase
+                .from('building')
+                .select('id, name_building, elec_meter, water_meter')
+                .eq('branch_id', parseInt(selectedBranchId))
+                .order('name_building');
+
+            if (!error) {
+                setBuildings(data || []);
+                // Reset building and rooms
+                setSelectedBuildingId('');
+                setRooms([]);
+            }
+        }
+
+        fetchBuildings();
+    }, [selectedBranchId]);
+
+    // Fetch Rooms when Building Changes
+    useEffect(() => {
+        async function fetchRooms() {
+            if (!selectedBuildingId) {
+                setRooms([]);
+                return;
+            }
+
+            try {
+                // Fetch Rooms
+                const { data: roomsData, error: roomsError } = await supabase
+                    .from('room')
+                    .select('*, building:building_id!inner(branch_id)')
+                    .eq('building_id', parseInt(selectedBuildingId))
+                    .order('room_number');
+
+                if (roomsError) throw roomsError;
+
+                // Fetch Active Contracts for Occupancy
+                // We optimize by filtering contracts for these rooms only
+                const roomIds = roomsData.map(r => r.id);
+                if (roomIds.length === 0) {
+                    setRooms([]);
+                    return;
+                }
+
+                const { data: activeContracts, error: contractsError } = await supabase
+                    .from('contract')
+                    .select('room_id, user:user_id!inner(is_primary_tenant)')
+                    .in('room_id', roomIds)
+                    .in('status', ['Active', 'active', 'complete', 'incomplete']);
+
+                if (contractsError) throw contractsError;
+
+                // Calculate occupancy and check for Primary Tenant
+                const occupancyMap = new Map<number, number>();
+                const primaryTenantMap = new Map<number, boolean>();
+
+                activeContracts?.forEach(c => {
+                    occupancyMap.set(c.room_id, (occupancyMap.get(c.room_id) || 0) + 1);
+                    // Check if any contract in this room belongs to a primary tenant
+                    // @ts-ignore: Supabase join typing can be tricky
+                    if (c.user?.is_primary_tenant) {
+                        primaryTenantMap.set(c.room_id, true);
+                    }
+                });
+
+                const roomsWithCount = roomsData.map(r => ({
+                    ...r,
+                    residentCount: occupancyMap.get(r.id) || 0,
+                    hasPrimaryTenant: primaryTenantMap.get(r.id) || false
+                }));
+
+                setRooms(roomsWithCount as (Room & { residentCount: number; hasPrimaryTenant: boolean })[]);
+
+            } catch (error) {
+                console.error("Error fetching rooms:", error);
+            }
+        }
+
+        fetchRooms();
+    }, [selectedBuildingId]);
+
+    // Update Contract Number Display & Count per Branch
+    useEffect(() => {
+        async function fetchBranchContractCount() {
+            const branch = branches.find(b => b.id.toString() === selectedBranchId);
+            if (!branch) {
+                setContractNumberDisplay('Select Branch...');
+                setBranchContractCount(0);
+                return;
+            }
+
+            // Count contracts that belong to rooms in this branch
+            const { count, error } = await supabase
+                .from('contract')
+                .select('id, room:room_id!inner(building:building_id!inner(branch_id))', { count: 'exact', head: true })
+                .eq('room.building.branch_id', branch.id);
+
+            const nextNum = (error || count === null) ? 1 : count + 1;
+            setBranchContractCount(nextNum);
+            setContractNumberDisplay(`${branch.city}_${branch.branches_name}_${nextNum}`);
+        }
+
+        fetchBranchContractCount();
+    }, [selectedBranchId, branches]);
+
+    // Handle room type change effects
+    useEffect(() => {
+        setFormData(prev => ({
+            ...prev,
+            room_id: '', // Reset room selection
+            is_primary_tenant: roomType === 'occupied' ? 'FALSE' : 'TRUE' // Auto-set primary tenant logic
+        }));
+    }, [roomType]);
+
+    // Update formData.pet when options change
+    useEffect(() => {
+        if (petOption === 'none') {
+            setFormData(prev => ({ ...prev, pet: 'none' }));
+        } else if (petOption === 'other') {
+            setFormData(prev => ({ ...prev, pet: petOtherText }));
+        } else {
+            setFormData(prev => ({ ...prev, pet: petOption }));
+        }
+    }, [petOption, petOtherText]);
+
+
+    const calculateMoveOutRange = (moveInDateStr: string, durationMonthsStr: string) => {
+        if (!moveInDateStr || !durationMonthsStr) return;
+
+        const moveIn = new Date(moveInDateStr);
+        const durations = parseInt(durationMonthsStr);
+
+        // Calculate Expected Move Out Date (Move In + Duration)
+        const expectedDate = new Date(moveIn);
+        expectedDate.setMonth(expectedDate.getMonth() + durations);
+
+        // Calculate Min and Max (+/- 7 days)
+        const minDate = new Date(expectedDate);
+        minDate.setDate(minDate.getDate() - 7);
+
+        const maxDate = new Date(expectedDate);
+        maxDate.setDate(maxDate.getDate() + 7);
+
+        setMoveOutRange({
+            min: minDate.toISOString().split('T')[0],
+            max: maxDate.toISOString().split('T')[0]
+        });
+
+        // Set default move_out to expected date
+        return expectedDate.toISOString().split('T')[0];
+    };
+
+    const formatPhoneNumber = (value: string) => {
+        const cleaned = value.replace(/\D/g, '');
+        const match = cleaned.match(/^(\d{0,3})(\d{0,3})(\d{0,4})$/);
+        if (match) {
+            return [match[1], match[2], match[3]].filter(x => x).join('-');
+        }
+        return value;
+    };
+
+    const formatThaiID = (value: string) => {
+        const cleaned = value.replace(/\D/g, '');
+        // X-XXXX-XXXXX-XX-X (1-4-5-2-1)
+        // 1 2345 67890 12 3
+        let formatted = '';
+        if (cleaned.length > 0) formatted += cleaned.substring(0, 1);
+        if (cleaned.length > 1) formatted += '-' + cleaned.substring(1, 5);
+        if (cleaned.length > 5) formatted += '-' + cleaned.substring(5, 10);
+        if (cleaned.length > 10) formatted += '-' + cleaned.substring(10, 12);
+        if (cleaned.length > 12) formatted += '-' + cleaned.substring(12, 13);
+        return formatted;
+    };
+
+    const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+        const { name, value } = e.target;
+
+        // Fullname Validation: Allow English only OR Thai only
+        if (name === 'full_name') {
+            // Check if input contains mixed scripts (excluding spaces)
+            const isEnglish = /^[a-zA-Z\s]*$/.test(value);
+            const isThai = /^[ก-๙\s]*$/.test(value);
+
+            if (!isEnglish && !isThai && value !== '') {
+                return; // Ignore invalid input
+            }
+        }
+
+        // Phone Validation (Numbers only for the typing part, we handle dash in UI but raw value here?)
+        if (name === 'phone') {
+            const raw = value.replace(/\D/g, '');
+            if (raw.length > 10) return; // Max 10 digits for standard mobile
+            const formatted = formatPhoneNumber(raw);
+            setFormData(prev => ({ ...prev, phone: formatted }));
+            return;
+        }
+
+        // Username Validation (English, digits, underscore)
+        if (name === 'username') {
+            if (!/^[a-zA-Z0-9_]*$/.test(value)) return;
+        }
+
+        // Password Validation (No Thai)
+        if (name === 'password') {
+            if (/[\u0E00-\u0E7F]/.test(value)) return;
+        }
+
+        // Identification Number
+        if (name === 'identification_number') {
+            if (formData.identification_type === 'THAI_ID') {
+                const raw = value.replace(/\D/g, '');
+                if (raw.length > 13) return;
+                const formatted = formatThaiID(raw);
+                setFormData(prev => ({ ...prev, identification_number: formatted }));
+                return;
+            } else if (formData.identification_type === 'PASSPORT') {
+                // Max 9 chars limit
+                if (value.length > 9) return;
+                // Allow alphanumeric only
+                if (!/^[a-zA-Z0-9]*$/.test(value)) return;
+            }
+        }
+
+        setFormData(prev => {
+            const updated = { ...prev, [name]: value };
+
+            // Auto-calculate move_out logic
+            if (name === 'move_in' || name === 'durations') {
+                const mIn = name === 'move_in' ? value : prev.move_in;
+                const dur = name === 'durations' ? value : prev.durations;
+
+                if (mIn && dur) {
+                    const defaultMoveOut = calculateMoveOutRange(mIn, dur);
+                    if (defaultMoveOut) updated.move_out = defaultMoveOut;
+                }
+            }
+
+            // Check if room selection is valid regarding primary tenant
+            if (name === 'room_id') {
+                const rId = parseInt(value);
+                const room = rooms.find(r => r.id === rId);
+
+                if (roomType === 'vacant') {
+                    if (room && room.residentCount > 0) {
+                        alert('Selected room is not vacant.');
+                        updated.room_id = '';
+                    }
+                    // Force TRUE for vacant rooms (first tenant must be primary)
+                    updated.is_primary_tenant = 'TRUE';
+                } else if (roomType === 'occupied') {
+                    if (room && room.residentCount >= 2) {
+                        alert('Room is full (Max 2 residents).');
+                        updated.room_id = '';
+                    } else if (room) {
+                        // If occupied, check if existing resident is primary
+                        if (room.hasPrimaryTenant) {
+                            // If primary exists, new one MUST be roommate (FALSE)
+                            updated.is_primary_tenant = 'FALSE';
+                        } else {
+                            // If NO primary exists (rare edge case or data issue), force TRUE
+                            updated.is_primary_tenant = 'TRUE';
+                        }
+                    }
+                }
+            }
+
+            // Check manual toggle of is_primary_tenant
+            if (name === 'is_primary_tenant') {
+                const rId = parseInt(formData.room_id);
+                const room = rooms.find(r => r.id === rId);
+
+                if (value === 'FALSE' && room && !room.hasPrimaryTenant) {
+                    alert('This room needs a Primary Tenant first. You cannot create a Roommate contract in a room without a Primary Tenant.');
+                    updated.is_primary_tenant = 'TRUE';
+                }
+            }
+
+            return updated;
+        });
+    };
+
+    const handleClear = () => {
+        setFormData({
+            full_name: '',
+            gender: 'male',
+            phone: '',
+            email: '',
+            pet: 'none',
+            residents: '1',
+            identification_number: '',
+            identification_type: 'THAI_ID',
+            nation: 'Thai',
+            room_id: '',
+            move_in: '',
+            durations: '12',
+            move_out: '',
+            username: '',
+            password: '',
+            is_primary_tenant: 'TRUE',
+            water_config_type: 'unit',
+            water_fixed_price: '',
+        });
+        setPetOption('none');
+        setPetOtherText('');
+        setCountryCode('+66');
+        setMoveOutRange({ min: '', max: '' });
+    };
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+
+        // Final Validations
+
+        // Password Length
+        if (formData.password.length < 8) {
+            alert('Password must be at least 8 characters long.');
+            return;
+        }
+
+        // Passport Pattern check
+        if (formData.identification_type === 'PASSPORT') {
+            // 2 letters + 7 numbers
+            if (!/^[a-zA-Z]{2}\d{1,7}$/.test(formData.identification_number)) {
+                alert('Passport format invalid. Must start with 2 letters followed by numbers (max 9 chars total).');
+                return;
+            }
+        }
+
+        // Thai ID Length
+        if (formData.identification_type === 'THAI_ID') {
+            const raw = formData.identification_number.replace(/-/g, '');
+            if (raw.length !== 13) {
+                alert('Thai ID must be 13 digits.');
+                return;
+            }
+        }
+
+        const rId = parseInt(formData.room_id);
+        const room = rooms.find(r => r.id === rId);
+
+        if (!room) {
+            alert('Please select a room.');
+            return;
+        }
+
+        // Primary Tenant Rule Check
+        if (formData.is_primary_tenant === 'FALSE' && !room.hasPrimaryTenant) {
+            alert('Cannot create a Roommate contract in a room without a Primary Tenant.');
+            return;
+        }
+
+        setSubmitting(true);
+
+        // Double check room capacity based on type
+        if (roomType === 'vacant') {
+            if (room && room.residentCount > 0) {
+                alert('Selected room is not vacant.');
+                setSubmitting(false);
+                return;
+            }
+        } else {
+            if (room && room.residentCount >= 2) {
+                alert('Room is full (Max 2 residents).');
+                setSubmitting(false);
+                return;
+            }
+        }
+
+        try {
+            // Combine Country code + Phone
+            const finalPhone = `(${countryCode}) ${formData.phone}`;
+
+            // 1. Create User
+            const { data: userData, error: userError } = await supabase
+                .from('users')
+                .insert([{
+                    full_name: formData.full_name,
+                    sex: formData.gender,
+                    phone: finalPhone,
+                    e_mail: formData.email,
+                    pet: formData.pet, // this is updated by effect
+                    identification_number: formData.identification_number,
+                    identification_type: formData.identification_type,
+                    nation: formData.nation,
+                    username: formData.username,
+                    password: formData.password,
+                    is_primary_tenant: formData.is_primary_tenant === 'TRUE',
+                    role: 'tenant',
+                }])
+                .select()
+                .single();
+
+            if (userError) throw userError;
+
+            // 2. Get Room details
+            const selectedRoom = rooms.find(r => r.id === parseInt(formData.room_id));
+
+            // 3. Create Contract (Status 'incomplete' initially, signed_at null)
+            const { data: contractData, error: contractError } = await supabase
+                .from('contract')
+                .insert([{
+                    user_id: userData.id,
+                    room_id: parseInt(formData.room_id),
+                    contract_number: 'PENDING',
+                    move_in: formData.move_in,
+                    move_out: formData.move_out,
+                    durations: parseInt(formData.durations),
+                    residents: parseInt(formData.residents),
+                    status: 'incomplete',
+                    signed_at: null,
+                    water_config_type: formData.water_config_type,
+                    water_fixed_price: formData.water_config_type === 'fixed' ? parseFloat(formData.water_fixed_price) || 0 : null,
+                }])
+                .select()
+                .single();
+
+            if (contractError) throw contractError;
+
+            // 3.1 Update Contract Number to {City}_{Branch}_{ID} format
+            if (contractData) {
+                // We use the ACTUAL ID from the inserted contract, which is safe from race conditions for display
+                const currentBranch = branches.find(b => b.id.toString() === selectedBranchId);
+
+                if (currentBranch) {
+                    const newContractNumber = `${currentBranch.city}_${currentBranch.branches_name}_${contractData.id}`;
+                    await supabase
+                        .from('contract')
+                        .update({ contract_number: newContractNumber })
+                        .eq('id', contractData.id);
+                }
+            }
+
+            // 4. Update Room status and Recalculate Residents from DB (Self-Correcting)
+            const { data: activeRoomContracts, error: countError } = await supabase
+                .from('contract')
+                .select('status')
+                .eq('room_id', parseInt(formData.room_id))
+                .in('status', ['Active', 'active', 'complete', 'incomplete']);
+
+            if (countError) throw countError;
+
+            // Count number of contracts instead of summing 'residents' field (1 contract = 1 person)
+            const totalResidents = activeRoomContracts?.length || 0;
+
+            let newStatus = 'vacant';
+            if (totalResidents > 0) {
+                // If there's at least one tenant who has "complete" status, it's occupied.
+                // Otherwise, if there's only "incomplete" or no one is "complete" yet, it's assign.
+                const hasComplete = activeRoomContracts?.some(c => ['complete', 'Active', 'active'].includes(c.status));
+                newStatus = hasComplete ? 'occupied' : 'assign';
+            }
+
+            await supabase
+                .from('room')
+                .update({
+                    status: newStatus, 
+                    current_residents: totalResidents
+                })
+                .eq('id', parseInt(formData.room_id));
+
+            // 5. Create Invoice (Entry Fee) - ONLY if Primary Tenant
+            if (contractData && formData.is_primary_tenant === 'TRUE') {
+                const billDate = new Date();
+                const dueDate = new Date(billDate);
+                dueDate.setDate(dueDate.getDate() + 7);
+
+                await supabase
+                    .from('invoice')
+                    .insert([{
+                        contract_id: contractData.id,
+                        room_deposit_cost: 5000,
+                        room_rent_cost: 0, // Rent is 0 (Post-paid: Collect at end of month)
+                        room_water_cost: 0,
+                        room_elec_cost: 0,
+                        room_repair_cost: 0,
+                        room_total_cost: 5000, // Total = Deposit
+                        status: 'Pending', // Initial status is Pending (Waiting for Manager Approval)
+                        type: 'entry_fee',
+                        bill_date: billDate.toISOString(),
+                        due_date: dueDate.toISOString(),
+                        paid_date: null
+                    }]);
+            }
+
+            alert('Contract created successfully!');
+            router.push('/manager/tenants');
+        } catch (error) {
+            console.error('Error creating contract:', error);
+            alert('Error creating contract: ' + (error as Error).message);
+        } finally {
+            setSubmitting(false);
+        }
+    };
+
+    if (loading) return <div className="p-8 text-center text-white">Loading...</div>;
+
+    const inputClass = "bg-white text-black text-sm rounded-lg px-4 py-2.5 border-2 border-blue-300 focus:outline-none focus:border-blue-500 w-full";
+    const labelClass = "block text-white text-xs mb-1 ml-1";
+    const selectClass = "bg-white text-black text-sm rounded-lg px-4 py-2.5 border-2 border-blue-300 focus:outline-none focus:border-blue-500 w-full appearance-none";
+
+    return (
+        <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-[#0047AB] w-full max-w-6xl rounded-3xl shadow-2xl p-8 text-white relative overflow-hidden">
+                {/* Background Pattern */}
+                <div className="absolute right-0 top-0 w-64 h-64 opacity-10 pointer-events-none select-none">
+                    <div className="text-[200px] font-bold text-white/20">📋</div>
+                </div>
+
+                {/* Back Button */}
+                <button
+                    type="button"
+                    onClick={() => router.push('/manager/tenants')}
+                    className="absolute top-6 left-6 flex items-center gap-2 text-white/80 hover:text-white transition-colors group z-20"
+                >
+                    <div className="bg-white/10 group-hover:bg-white/20 p-2 rounded-full transition-colors">
+                        <ArrowLeft size={20} />
+                    </div>
+                    <span className="font-bold hidden sm:inline">Back</span>
+                </button>
+
+                {/* Header */}
+                <div className="text-center mb-6">
+                    <h1 className="text-4xl font-bold">Contract</h1>
+                    <p className="text-sm opacity-80">Contract Number : {contractNumberDisplay}</p>
+                </div>
+
+                <div className="border-b border-white/30 mb-6" />
+
+                <form onSubmit={handleSubmit}>
+                    {/* Row 1: Full name, Gender, Phone */}
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+                        <div className="md:col-span-2">
+                            <label className={labelClass}>Full name (Thai or English only)</label>
+                            <input
+                                type="text"
+                                name="full_name"
+                                value={formData.full_name}
+                                onChange={handleChange}
+                                className={inputClass}
+                                placeholder="ex. Somsak Rakthai"
+                                required
+                            />
+                        </div>
+                        <div>
+                            <label className={labelClass}>Gender</label>
+                            <select name="gender" value={formData.gender} onChange={handleChange} className={selectClass}>
+                                <option value="male">male</option>
+                                <option value="female">female</option>
+                                <option value="LGBTQ+">LGBTQ+</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className={labelClass}>Phone</label>
+                            <div className="flex gap-2">
+                                <select
+                                    className={`${selectClass} w-20 px-1 text-center`}
+                                    value={countryCode}
+                                    onChange={(e) => setCountryCode(e.target.value)}
+                                >
+                                    <option value="+66">🇹🇭 +66</option>
+                                    <option value="+1">🇺🇸 +1</option>
+                                    <option value="+44">🇬🇧 +44</option>
+                                    <option value="+81">🇯🇵 +81</option>
+                                    <option value="+86">🇨🇳 +86</option>
+                                </select>
+                                <input
+                                    type="tel"
+                                    name="phone"
+                                    value={formData.phone}
+                                    onChange={handleChange}
+                                    className={inputClass}
+                                    placeholder="XXX-XXX-XXXX"
+                                    required
+                                />
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Row 2: Email, Pet, Residents */}
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+                        <div className="md:col-span-2">
+                            <label className={labelClass}>E-mail</label>
+                            <input
+                                type="email"
+                                name="email"
+                                value={formData.email}
+                                onChange={handleChange}
+                                className={inputClass}
+                                placeholder="example@email.com"
+                            />
+                        </div>
+                        <div>
+                            <label className={labelClass}>Pet</label>
+                            <div className="flex gap-2">
+                                <select
+                                    value={petOption}
+                                    onChange={(e) => setPetOption(e.target.value as 'none' | 'dog' | 'cat' | 'other')}
+                                    className={selectClass}
+                                >
+                                    <option value="none">None</option>
+                                    <option value="dog">Dog</option>
+                                    <option value="cat">Cat</option>
+                                    <option value="other">Other</option>
+                                </select>
+                            </div>
+                            {petOption === 'other' && (
+                                <input
+                                    type="text"
+                                    value={petOtherText}
+                                    onChange={(e) => setPetOtherText(e.target.value)}
+                                    className={`${inputClass} mt-2`}
+                                    placeholder="Specify pet..."
+                                    required
+                                />
+                            )}
+                        </div>
+                        <div>
+                            <label className={labelClass}>Residents</label>
+                            <select
+                                name="residents"
+                                value={formData.residents}
+                                onChange={handleChange}
+                                className={selectClass}
+                            >
+                                <option value="1">1 Person</option>
+                                <option value="2">2 People</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    {/* Row 3: Identification Number, Identification Type, Nation */}
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+                        <div className="md:col-span-2">
+                            <label className={labelClass}>Identification Number</label>
+                            <input
+                                type="text"
+                                name="identification_number"
+                                value={formData.identification_number}
+                                onChange={handleChange}
+                                className={inputClass}
+                                placeholder={formData.identification_type === 'THAI_ID' ? "X-XXXX-XXXXX-XX-X" : "Passport Number"}
+                                required
+                            />
+                        </div>
+                        <div>
+                            <label className={labelClass}>Identification Type</label>
+                            <select name="identification_type" value={formData.identification_type} onChange={handleChange} className={selectClass}>
+                                <option value="THAI_ID">THAI_ID</option>
+                                <option value="PASSPORT">PASSPORT</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className={labelClass}>Nation</label>
+                            <input
+                                type="text"
+                                name="nation"
+                                value={formData.nation}
+                                onChange={handleChange}
+                                className={inputClass}
+                            />
+                        </div>
+                    </div>
+
+                    {/* Row 4: Location (Branch, Building, Room) */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                        {/* Branch */}
+                        <div>
+                            <label className={labelClass}>Branch</label>
+                            <select
+                                value={selectedBranchId}
+                                onChange={(e) => setSelectedBranchId(e.target.value)}
+                                className={`${selectClass} ${typeof window !== 'undefined' &&
+                                    localStorage.getItem('user_role')?.toLowerCase() === 'manager' &&
+                                    localStorage.getItem('user_branch_id')
+                                    ? 'opacity-70 cursor-not-allowed'
+                                    : ''
+                                    }`}
+                                disabled={
+                                    typeof window !== 'undefined' &&
+                                    localStorage.getItem('user_role')?.toLowerCase() === 'manager' &&
+                                    !!localStorage.getItem('user_branch_id')
+                                }
+                            >
+                                <option value="">Select Branch</option>
+                                {branches.map(b => (
+                                    <option key={b.id} value={b.id}>
+                                        {b.branches_name} ({b.city})
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+
+                        {/* Building */}
+                        <div>
+                            <label className={labelClass}>Building</label>
+                            <select
+                                value={selectedBuildingId}
+                                onChange={(e) => setSelectedBuildingId(e.target.value)}
+                                className={selectClass}
+                                disabled={!selectedBranchId}
+                            >
+                                <option value="">Select Building</option>
+                                {buildings.map(b => (
+                                    <option key={b.id} value={b.id}>
+                                        {b.name_building}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+
+                        {/* Room */}
+                        <div>
+                            <div className="flex justify-between items-center mb-1">
+                                <label className={labelClass}>Room</label>
+                                {/* Room Type Toggle */}
+                                <div className="flex bg-blue-400 rounded-lg p-0.5 pointer-events-auto z-10">
+                                    <button
+                                        type="button"
+                                        onClick={() => setRoomType('vacant')}
+                                        className={`text-[10px] px-2 py-0.5 rounded-md transition-all ${roomType === 'vacant' ? 'bg-white text-[#0047AB] font-bold' : 'text-white/70'}`}
+                                    >
+                                        Vacant
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setRoomType('occupied')}
+                                        className={`text-[10px] px-2 py-0.5 rounded-md transition-all ${roomType === 'occupied' ? 'bg-white text-[#0047AB] font-bold' : 'text-white/70'}`}
+                                    >
+                                        Occupied
+                                    </button>
+                                </div>
+                            </div>
+                            <select name="room_id" value={formData.room_id} onChange={handleChange} className={selectClass} required disabled={!selectedBuildingId}>
+                                <option value="">Select Room</option>
+                                {rooms
+                                    .filter(room => {
+                                        // Pet Filter
+                                        const hasPet = formData.pet && formData.pet.toLowerCase() !== 'none' && formData.pet.trim() !== '';
+                                        if (hasPet && !room.pet_status) return false;
+
+                                        if (roomType === 'vacant') {
+                                            return room.status === 'vacant' || room.residentCount === 0;
+                                        } else {
+                                            return room.residentCount > 0 && room.residentCount < 2;
+                                        }
+                                    })
+                                    .map(room => (
+                                        <option key={room.id} value={room.id}>
+                                            {room.room_number} ({room.residentCount}/2)
+                                        </option>
+                                    ))}
+                            </select>
+                        </div>
+                    </div>
+
+                    {/* Row 4.5: Utility Billing Configuration */}
+                    <div className="bg-white/10 p-4 rounded-xl border border-white/20 mb-4">
+                        <h3 className="text-white font-bold mb-3 flex items-center gap-2">
+                            <span>Utility Billing Settings</span>
+                            {selectedBuildingId && (
+                                <span className="text-xs font-normal text-blue-200 bg-blue-900/50 px-2 py-0.5 rounded ml-2">
+                                    Base Electricity: {buildings.find(b => b.id === parseInt(selectedBuildingId))?.elec_meter || 0} THB/Unit
+                                    | Base Water: {buildings.find(b => b.id === parseInt(selectedBuildingId))?.water_meter || 0} THB/Unit
+                                </span>
+                            )}
+                        </h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label className={labelClass}>Water Calculation Method</label>
+                                <select
+                                    name="water_config_type"
+                                    value={formData.water_config_type}
+                                    onChange={handleChange}
+                                    className={selectClass}
+                                >
+                                    <option value="unit">Per Unit (ตามมิเตอร์จริง)</option>
+                                    <option value="fixed">Fixed Monthly Price (เหมาจ่าย)</option>
+                                </select>
+                            </div>
+
+                            {formData.water_config_type === 'fixed' && (
+                                <div>
+                                    <label className={labelClass}>Water Fixed Price (THB/Month)</label>
+                                    <input
+                                        type="number"
+                                        name="water_fixed_price"
+                                        value={formData.water_fixed_price}
+                                        onChange={handleChange}
+                                        className={inputClass}
+                                        placeholder="e.g. 100"
+                                        min="0"
+                                        step="0.01"
+                                        required={formData.water_config_type === 'fixed'}
+                                    />
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Row 5: Dates */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                        <div>
+                            <label className={labelClass}>Move in</label>
+                            <input
+                                type="date"
+                                name="move_in"
+                                value={formData.move_in}
+                                onChange={handleChange}
+                                className={inputClass}
+                                required
+                            />
+                        </div>
+                        <div>
+                            <label className={labelClass}>Durations (Months)</label>
+                            <input
+                                type="number"
+                                name="durations"
+                                value={formData.durations}
+                                onChange={handleChange}
+                                className={inputClass}
+                                min="1"
+                                required
+                            />
+                        </div>
+                        <div>
+                            <label className={labelClass}>Move out</label>
+                            <input
+                                type="date"
+                                name="move_out"
+                                value={formData.move_out}
+                                onChange={handleChange}
+                                className={inputClass}
+                                min={moveOutRange.min}
+                                max={moveOutRange.max}
+                                required
+                            />
+                            <p className="text-[10px] text-white/70 mt-1">
+                                * สามารถออกได้ก่อนหรือหลัง 7 วันจากวันที่นับตามจริง
+                            </p>
+                        </div>
+                    </div>
+
+                    {/* Row 4: Username, Password, Is primary tenant */}
+                    <div className="grid grid-cols-3 gap-4 mb-8">
+                        <div>
+                            <label className={labelClass}>Username (English only)</label>
+                            <input
+                                type="text"
+                                name="username"
+                                value={formData.username}
+                                onChange={handleChange}
+                                className={inputClass}
+                                placeholder=""
+                                required
+                            />
+                        </div>
+                        <div className="relative">
+                            <label className={labelClass}>Password (Min 8 chars, No Thai)</label>
+                            <div className="relative">
+                                <input
+                                    type={showPassword ? "text" : "password"}
+                                    name="password"
+                                    value={formData.password}
+                                    onChange={handleChange}
+                                    className={`${inputClass} pr-10`}
+                                    placeholder=""
+                                    required
+                                />
+                                <button
+                                    type="button"
+                                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700"
+                                    onMouseDown={() => setShowPassword(true)}
+                                    onMouseUp={() => setShowPassword(false)}
+                                    onTouchStart={() => setShowPassword(true)} // Mobile support
+                                    onTouchEnd={() => setShowPassword(false)}
+                                >
+                                    {showPassword ? <EyeOff size={20} /> : <Eye size={20} />}
+                                </button>
+                            </div>
+                        </div>
+                        <div>
+                            <label className={labelClass}>Is primary tenant</label>
+                            <select
+                                name="is_primary_tenant"
+                                value={formData.is_primary_tenant}
+                                onChange={handleChange}
+                                className={`${selectClass} ${roomType === 'occupied' ? 'bg-gray-200 text-gray-500 cursor-not-allowed' : ''}`}
+                                disabled={roomType === 'occupied'}
+                            >
+                                <option value="TRUE">TRUE</option>
+                                <option value="FALSE">FALSE</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    {/* Buttons */}
+                    <div className="flex justify-center gap-4">
+                        <button
+                            type="submit"
+                            disabled={submitting}
+                            className={`px-10 py-3 rounded-full font-bold text-lg transition-all ${submitting ? 'bg-gray-400 cursor-not-allowed' : 'bg-green-500 hover:bg-green-600'} text-white shadow-lg`}
+                        >
+                            {submitting ? 'Creating...' : 'Confirm'}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={handleClear}
+                            className="px-10 py-3 rounded-full font-bold text-lg bg-red-500 hover:bg-red-600 text-white shadow-lg transition-all"
+                        >
+                            Clear
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    );
+}
